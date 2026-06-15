@@ -3,8 +3,8 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "phetk"
-version = "0.2.12.spa"
+name = "phetk-spa"
+version = "0.2.13"
 requires-python = ">=3.10"
 license = {text = "GPL-3.0"}
 authors = [
