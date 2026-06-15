@@ -47,7 +47,7 @@ class PheWAS:
         suppress_warnings: bool = True,
         method: str = "logit",
         use_spa: bool = False,
-        spa_cutoff: float = 2.0,
+        spa_cutoff: float = 0.05,
         batch_size: int | None = None,
         fall_back_to_serial: bool = False
     ):
@@ -85,9 +85,11 @@ class PheWAS:
             use_spa: If True, use saddle point approximation (SPA) to compute p-values for logistic
                 regression. Recommended for phenotypes with imbalanced case-control ratios where the
                 normal/Wald approximation can inflate type I error. Only applies when method="logit".
-            spa_cutoff: Standardized score statistic threshold above which the SPA correction is applied.
-                When the absolute standardized score is below this value, the unadjusted (normal
-                approximation) p-value is used for speed, following the SPAtest/SAIGE convention. Default 2.0.
+            spa_cutoff: P-value threshold from the initial normal approximation below which the SPA
+                correction is applied. When the normal-approximation p-value is greater than this
+                threshold, the unadjusted p-value is returned directly for speed. When the p-value
+                is at or below this threshold, SPA is applied to control type I error inflation,
+                following the SAIGE convention. Default 0.05.
             batch_size: Number of phecodes to process per batch for parallelization. If None, defaults to 1 for logit and 10 for cox.
             fall_back_to_serial: Whether to fall back to serial processing when parallelization fails.
         """
@@ -695,7 +697,7 @@ class PheWAS:
             "odds_ratio": odds_ratio,
             "log10_odds_ratio": log10_odds_ratio,
             "converged": converged,
-            "spa_applied": False
+            "is_SPA": False
         }
 
     @staticmethod
@@ -830,8 +832,9 @@ class PheWAS:
         Perform a saddle point approximation score test for the variable of interest.
 
         Computes the score statistic S = sum_i g_i * (y_i - mu_i) under the null model and
-        evaluates its p-value. When the standardized score is small the normal approximation
-        is returned directly; otherwise the SPA correction is applied to both tails.
+        evaluates its p-value using the SAIGE convention: if the initial normal-approximation
+        p-value is greater than spa_cutoff, the unadjusted p-value is returned directly for
+        speed; if it is at or below spa_cutoff, the SPA correction is applied to both tails.
 
         Args:
             g: Covariate-adjusted variable of interest (residualized on covariates).
@@ -852,8 +855,9 @@ class PheWAS:
         score = q - m1
         pval_noadj = float(chi2.sf((score ** 2) / var1, df=1))
 
-        # Only apply the relatively expensive SPA when the standardized score is large enough.
-        if abs(score) / np.sqrt(var1) < self.spa_cutoff:
+        # If the initial normal-approximation p-value is above the threshold, there is no
+        # meaningful tail inflation risk; return the unadjusted value directly (SAIGE convention).
+        if pval_noadj > self.spa_cutoff:
             return pval_noadj, False, score, var1
 
         # Mirror the observed statistic about its mean to obtain the opposite tail.
@@ -945,7 +949,7 @@ class PheWAS:
             "odds_ratio": odds_ratio,
             "log10_odds_ratio": log10_odds_ratio,
             "converged": str(converged),
-            "spa_applied": spa_applied
+            "is_SPA": spa_applied
         }
         return {**base_dict, **stats_dict}
 
@@ -993,7 +997,8 @@ class PheWAS:
             "log_hazard_ratio": log_hazard_ratio,
             "concordance_index": concordance_index,
             "stratified_by": stratified_by,
-            "convergence": warning_message
+            "convergence": warning_message,
+            "is_SPA": False
         }
 
         return result_dict
@@ -1317,7 +1322,7 @@ class PheWAS:
             param_dict["--use_exclusion"] = "True"
         if self.use_spa:
             param_dict["--use_spa"] = "True"
-            if self.spa_cutoff != 2.0:
+            if self.spa_cutoff != 0.05:
                 param_dict["--spa_cutoff"] = self.spa_cutoff
         if self.verbose:
             param_dict["--verbose"] = "True"
@@ -1674,8 +1679,9 @@ def main() -> None:
                         help="Whether to use saddle point approximation (SPA) for logistic regression p-values. "
                              "Recommended for imbalanced case-control ratios. Only applies when method='logit'.")
     parser.add_argument("--spa_cutoff",
-                        type=float, required=False, default=2.0,
-                        help="Standardized score threshold above which the SPA correction is applied. Default 2.0.")
+                        type=float, required=False, default=0.05,
+                        help="P-value threshold from the initial normal approximation at or below which "
+                             "the SPA correction is applied (SAIGE convention). Default 0.05.")
     parser.add_argument("--cox_start_date_col",
                         type=str, required=False,
                         help="Start date column for Cox regression.")

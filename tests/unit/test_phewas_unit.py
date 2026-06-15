@@ -214,7 +214,7 @@ def spa_instance():
     _logit_spa_regression.
     """
     pw = object.__new__(PheWAS)
-    pw.spa_cutoff = 2.0
+    pw.spa_cutoff = 0.05
     return pw
 
 
@@ -277,35 +277,43 @@ class TestSpaHelpers:
 class TestSpaTest:
     """Behavioral tests for _spa_test using a minimal PheWAS instance."""
 
-    def test_below_cutoff_no_adjustment(self, spa_instance):
-        """When the standardized score |z| < spa_cutoff, spa_applied must be False."""
+    def test_above_cutoff_pvalue_no_adjustment(self, spa_instance):
+        """When the normal-approximation p-value > spa_cutoff, spa_applied must be False.
+
+        Uses a null setup (no real effect) so the initial p-value will be large.
+        """
         rng = np.random.default_rng(10)
-        n = 300
-        # Balanced probabilities → score statistic is approximately standard normal
+        n = 1000
+        # Balanced, no effect → normal-approximation p-value should be large
         mu = np.full(n, 0.5)
         g = rng.standard_normal(n)
         g = g - g.mean()  # center so expected score ≈ 0
         y = (rng.uniform(size=n) < mu).astype(float)
         score = float(np.sum(g * (y - mu)))
         var1 = float(np.sum(mu * (1 - mu) * g ** 2))
-        if abs(score) / np.sqrt(var1) < spa_instance.spa_cutoff:
+        pval_noadj = float(chi2.sf(score ** 2 / var1, df=1))
+        if pval_noadj > spa_instance.spa_cutoff:
             _, applied, _, _ = spa_instance._spa_test(g, mu, y)
             assert applied is False
 
-    def test_above_cutoff_applies_spa(self, spa_instance):
-        """When |z| > spa_cutoff, _spa_test must set spa_applied = True."""
+    def test_at_or_below_cutoff_applies_spa(self, spa_instance):
+        """When the normal-approximation p-value <= spa_cutoff, SPA must be applied.
+
+        Constructs a strong rare-disease signal so the initial p-value falls below
+        the 0.05 threshold, which triggers the SPA correction.
+        """
         rng = np.random.default_rng(11)
         n = 3000
-        # Very rare cases + rare allele → strong signal pushes z well above cutoff
+        # Very rare cases + rare allele → strong signal, initial p-value well below 0.05
         mu = np.full(n, 0.005)
         g = (rng.uniform(size=n) < 0.08).astype(float)
         y = np.zeros(n)
         carrier_idx = np.where(g == 1)[0]
-        # Place cases exclusively among carriers to maximise z
         y[carrier_idx[: min(30, len(carrier_idx))]] = 1.0
         score = float(np.sum(g * (y - mu)))
         var1 = float(np.sum(mu * (1 - mu) * g ** 2))
-        if abs(score) / np.sqrt(var1) >= spa_instance.spa_cutoff:
+        pval_noadj = float(chi2.sf(score ** 2 / var1, df=1))
+        if pval_noadj <= spa_instance.spa_cutoff:
             _, applied, _, _ = spa_instance._spa_test(g, mu, y)
             assert applied is True
 
@@ -388,7 +396,7 @@ class TestLogitSpaRegression:
             "phecode", "cases", "controls",
             "p_value", "neg_log_p_value", "standard_error",
             "beta", "conf_int_1", "conf_int_2",
-            "odds_ratio", "log10_odds_ratio", "converged", "spa_applied",
+            "odds_ratio", "log10_odds_ratio", "converged", "is_SPA",
         }
         assert required_keys.issubset(set(result.keys()))
 
