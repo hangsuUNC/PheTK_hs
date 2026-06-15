@@ -3,6 +3,7 @@ from datetime import datetime
 from io import StringIO
 from lifelines import CoxPHFitter, utils as u
 from multiprocessing import get_context
+from scipy.stats import chi2, norm
 from tqdm import tqdm
 import argparse
 import copy
@@ -45,6 +46,8 @@ class PheWAS:
         verbose: bool = False,
         suppress_warnings: bool = True,
         method: str = "logit",
+        use_spa: bool = False,
+        spa_cutoff: float = 2.0,
         batch_size: int | None = None,
         fall_back_to_serial: bool = False
     ):
@@ -79,6 +82,12 @@ class PheWAS:
             verbose: If True, print progress information for each phecode.
             suppress_warnings: If True, suppress convergence and statistical warnings.
             method: Analysis method ("logit" for logistic regression or "cox" for Cox regression).
+            use_spa: If True, use saddle point approximation (SPA) to compute p-values for logistic
+                regression. Recommended for phenotypes with imbalanced case-control ratios where the
+                normal/Wald approximation can inflate type I error. Only applies when method="logit".
+            spa_cutoff: Standardized score statistic threshold above which the SPA correction is applied.
+                When the absolute standardized score is below this value, the unadjusted (normal
+                approximation) p-value is used for speed, following the SPAtest/SAIGE convention. Default 2.0.
             batch_size: Number of phecodes to process per batch for parallelization. If None, defaults to 1 for logit and 10 for cox.
             fall_back_to_serial: Whether to fall back to serial processing when parallelization fails.
         """
@@ -158,6 +167,8 @@ class PheWAS:
         self.min_phecode_count = min_phecode_count
         self.suppress_warnings = suppress_warnings
         self.method = method
+        self.use_spa = use_spa
+        self.spa_cutoff = spa_cutoff
         # Set default batch_size based on method if None
         if batch_size is None:
             if method == "logit":
@@ -338,6 +349,8 @@ class PheWAS:
             method_text = "Cox regression"
         elif self.method == "logit":
             method_text = "Logistic regression"
+            if self.use_spa:
+                method_text += " (saddle point approximation)"
         print("Analysis method: ", method_text)
         print()
         
@@ -681,8 +694,260 @@ class PheWAS:
             "conf_int_2": conf_int_2,
             "odds_ratio": odds_ratio,
             "log10_odds_ratio": log10_odds_ratio,
-            "converged": converged
+            "converged": converged,
+            "spa_applied": False
         }
+
+    @staticmethod
+    def _spa_k1_adj(t, mu, g, q):
+        """
+        Evaluate the first derivative of the cumulant generating function (CGF) minus the
+        target statistic value, i.e. K'(t) - q.
+
+        The CGF corresponds to the raw score statistic S = sum_i g_i * y_i under the null
+        model, where y_i ~ Bernoulli(mu_i). Solving K'(t) = q yields the saddle point.
+
+        Args:
+            t: Evaluation point.
+            mu: Fitted probabilities under the null model.
+            g: Covariate-adjusted variable of interest.
+            q: Target value of the score statistic.
+
+        Returns:
+            Value of K'(t) - q.
+        """
+        et = np.exp(g * t)
+        return float(np.sum(mu * g * et / (1.0 - mu + mu * et)) - q)
+
+    @staticmethod
+    def _spa_k2(t, mu, g):
+        """
+        Evaluate the second derivative of the cumulant generating function K''(t).
+
+        Args:
+            t: Evaluation point.
+            mu: Fitted probabilities under the null model.
+            g: Covariate-adjusted variable of interest.
+
+        Returns:
+            Value of K''(t).
+        """
+        et = np.exp(g * t)
+        denom = 1.0 - mu + mu * et
+        return float(np.sum((1.0 - mu) * mu * (g ** 2) * et / (denom ** 2)))
+
+    @classmethod
+    def _spa_getroot_k1(cls, init, mu, g, q, tol=None, max_iter=1000):
+        """
+        Find the saddle point by solving K'(t) = q with a guarded Newton-Raphson scheme.
+
+        Mirrors the root-finding routine used in SPAtest/SAIGE, including the bisection
+        safeguard when a Newton step overshoots and changes the sign of K'(t) - q.
+
+        Args:
+            init: Initial value for the root search.
+            mu: Fitted probabilities under the null model.
+            g: Covariate-adjusted variable of interest.
+            q: Target value of the score statistic.
+            tol: Convergence tolerance on successive root estimates.
+            max_iter: Maximum number of Newton iterations.
+
+        Returns:
+            Tuple of (root, converged) where converged indicates whether the search succeeded.
+        """
+        if tol is None:
+            tol = np.finfo(float).eps ** 0.25
+
+        # K'(t) is bounded by the sum of positive/negative g values (Bernoulli saturation).
+        # A target q outside this range corresponds to a root at +/- infinity.
+        g_pos = float(np.sum(g[g > 0]))
+        g_neg = float(np.sum(g[g < 0]))
+        if q >= g_pos or q <= g_neg:
+            return np.inf, True
+
+        t = float(init)
+        k1_eval = cls._spa_k1_adj(t, mu, g, q)
+        prev_jump = np.inf
+        converged = False
+        for _ in range(max_iter):
+            k2_eval = cls._spa_k2(t, mu, g)
+            if k2_eval == 0 or not np.isfinite(k2_eval):
+                break
+            t_new = t - k1_eval / k2_eval
+            if not np.isfinite(t_new):
+                break
+            if abs(t_new - t) < tol:
+                t = t_new
+                converged = True
+                break
+            new_k1 = cls._spa_k1_adj(t_new, mu, g, q)
+            if np.sign(k1_eval) != np.sign(new_k1):
+                if abs(t_new - t) > prev_jump - tol:
+                    t_new = t + np.sign(new_k1 - k1_eval) * prev_jump / 2.0
+                    new_k1 = cls._spa_k1_adj(t_new, mu, g, q)
+                    prev_jump = prev_jump / 2.0
+                else:
+                    prev_jump = abs(t_new - t)
+            t = t_new
+            k1_eval = new_k1
+
+        return t, converged
+
+    @classmethod
+    def _spa_get_saddle_prob(cls, zeta, mu, g, q):
+        """
+        Compute a tail probability at the saddle point using the Lugannani-Rice formula.
+
+        Args:
+            zeta: Saddle point (root of K'(t) = q).
+            mu: Fitted probabilities under the null model.
+            g: Covariate-adjusted variable of interest.
+            q: Target value of the score statistic.
+
+        Returns:
+            Signed tail probability (sign carried for two-sided combination).
+        """
+        k1 = float(np.sum(np.log(1.0 - mu + mu * np.exp(g * zeta))))
+        k2 = cls._spa_k2(zeta, mu, g)
+        if not (np.isfinite(k1) and np.isfinite(k2)) or k2 <= 0:
+            return 0.0
+
+        temp = zeta * q - k1
+        if temp <= 0:
+            return 0.0
+        w = np.sign(zeta) * np.sqrt(2.0 * temp)
+        v = zeta * np.sqrt(k2)
+        if w == 0:
+            return 0.0
+        z_test = w + (1.0 / w) * np.log(v / w)
+        if z_test > 0:
+            return float(norm.sf(z_test))
+        else:
+            return float(-norm.cdf(z_test))
+
+    def _spa_test(self, g, mu, y):
+        """
+        Perform a saddle point approximation score test for the variable of interest.
+
+        Computes the score statistic S = sum_i g_i * (y_i - mu_i) under the null model and
+        evaluates its p-value. When the standardized score is small the normal approximation
+        is returned directly; otherwise the SPA correction is applied to both tails.
+
+        Args:
+            g: Covariate-adjusted variable of interest (residualized on covariates).
+            mu: Fitted probabilities under the null (covariate-only) model.
+            y: Binary outcome vector.
+
+        Returns:
+            Tuple of (p_value, spa_applied, score, variance) where score is the centered
+            score statistic and variance is its null variance.
+        """
+        q = float(np.sum(g * y))
+        m1 = float(np.sum(g * mu))
+        var1 = float(np.sum(mu * (1.0 - mu) * (g ** 2)))
+
+        if var1 <= 0 or not np.isfinite(var1):
+            return np.nan, False, np.nan, var1
+
+        score = q - m1
+        pval_noadj = float(chi2.sf((score ** 2) / var1, df=1))
+
+        # Only apply the relatively expensive SPA when the standardized score is large enough.
+        if abs(score) / np.sqrt(var1) < self.spa_cutoff:
+            return pval_noadj, False, score, var1
+
+        # Mirror the observed statistic about its mean to obtain the opposite tail.
+        q_inv = -np.sign(score) * abs(score) + m1
+        root1, conv1 = self._spa_getroot_k1(0.0, mu, g, q)
+        root2, conv2 = self._spa_getroot_k1(0.0, mu, g, q_inv)
+        if conv1 and conv2:
+            p1 = self._spa_get_saddle_prob(root1, mu, g, q)
+            p2 = self._spa_get_saddle_prob(root2, mu, g, q_inv)
+            pval = abs(p1) + abs(p2)
+            # Fall back to the normal approximation if SPA returns a degenerate result.
+            if not np.isfinite(pval) or pval <= 0 or pval > 1:
+                return pval_noadj, False, score, var1
+            return pval, True, score, var1
+        else:
+            return pval_noadj, False, score, var1
+
+    def _logit_spa_regression(self, y, regressors, var_of_interest_index, base_dict):
+        """
+        Run a logistic regression score test with saddle point approximation.
+
+        Fits the null model using covariates only (excluding the variable of interest),
+        residualizes the variable of interest on the covariates, and computes an SPA-corrected
+        p-value for the score statistic. Effect size estimates (beta, odds ratio) are derived
+        from the score statistic, and the standard error/confidence interval are back-calculated
+        so that they are consistent with the reported p-value (SAIGE convention).
+
+        Args:
+            y: Binary outcome vector.
+            regressors: Full design matrix including the variable of interest and a constant.
+            var_of_interest_index: Column index of the variable of interest in regressors.
+            base_dict: Base result dictionary (phecode, cases, controls).
+
+        Returns:
+            Combined result dictionary, or None if the null model could not be fit.
+        """
+        y = np.asarray(y, dtype=float)
+        regressors = np.asarray(regressors, dtype=float)
+        g = regressors[:, var_of_interest_index].astype(float)
+        null_design = np.delete(regressors, var_of_interest_index, axis=1)
+
+        # Fit the null (covariate-only) logistic regression model.
+        try:
+            null_fit = sm.Logit(y, null_design, missing="drop").fit(disp=False)
+        except Exception:
+            return None
+
+        mu = np.asarray(null_fit.predict(null_design), dtype=float)
+        converged = bool(null_fit.mle_retvals.get("converged", False)) if hasattr(null_fit, "mle_retvals") else False
+
+        # Residualize the variable of interest on the covariates using IRLS weights so that
+        # the score statistic properly accounts for covariate adjustment.
+        weights = mu * (1.0 - mu)
+        weighted_design_t = null_design.T * weights
+        xtwx = weighted_design_t @ null_design
+        xtwg = weighted_design_t @ g
+        try:
+            adj_coef = np.linalg.solve(xtwx, xtwg)
+        except np.linalg.LinAlgError:
+            adj_coef = np.linalg.lstsq(xtwx, xtwg, rcond=None)[0]
+        g_adj = g - null_design @ adj_coef
+
+        p_value, spa_applied, score, var1 = self._spa_test(g_adj, mu, y)
+        if not np.isfinite(p_value) or var1 <= 0:
+            return None
+
+        # Score-based effect estimate; standard error back-calculated from the p-value so the
+        # reported confidence interval is consistent with the (possibly SPA-corrected) p-value.
+        beta = score / var1
+        p_value = min(max(p_value, np.finfo(float).tiny), 1.0)
+        z_equiv = np.sqrt(chi2.isf(p_value, df=1))
+        if z_equiv <= 0 or not np.isfinite(z_equiv):
+            standard_error = abs(beta) / np.sqrt(score ** 2 / var1) if score != 0 else np.nan
+        else:
+            standard_error = abs(beta) / z_equiv
+        odds_ratio = float(np.exp(beta))
+        log10_odds_ratio = float(np.log10(odds_ratio))
+        conf_int_1 = beta - 1.959963984540054 * standard_error
+        conf_int_2 = beta + 1.959963984540054 * standard_error
+        neg_log_p_value = -np.log10(p_value)
+
+        stats_dict = {
+            "p_value": p_value,
+            "neg_log_p_value": neg_log_p_value,
+            "standard_error": standard_error,
+            "beta": beta,
+            "conf_int_1": conf_int_1,
+            "conf_int_2": conf_int_2,
+            "odds_ratio": odds_ratio,
+            "log10_odds_ratio": log10_odds_ratio,
+            "converged": str(converged),
+            "spa_applied": spa_applied
+        }
+        return {**base_dict, **stats_dict}
 
     def _cox_result_prep(
             self, 
@@ -857,6 +1122,22 @@ class PheWAS:
                 var_index = regressors.columns.index(independent_variable_of_interest)
                 regressors = regressors.to_numpy()
                 regressors = sm.tools.add_constant(regressors, prepend=False)
+
+                # OPTION 2A: SADDLE POINT APPROXIMATION SCORE TEST
+                # Recommended for imbalanced case-control ratios; fits a covariate-only null
+                # model and computes an SPA-corrected p-value for the variable of interest.
+                if self.use_spa:
+                    result_dict = self._logit_spa_regression(
+                        y=y,
+                        regressors=regressors,
+                        var_of_interest_index=var_index,
+                        base_dict=base_dict
+                    )
+                    if result_dict is not None and verbose:
+                        print(f"Phecode {phecode} ({len(cases)} cases/{len(controls)} controls): {result_dict}\n")
+                    return result_dict
+
+                # OPTION 2B: STANDARD (WALD) LOGISTIC REGRESSION
                 logit = sm.Logit(y, regressors, missing="drop")
 
                 # Catch Singular matrix error
@@ -1034,6 +1315,10 @@ class PheWAS:
             param_dict["--phecode_map_file_path"] = "$PHECODE_MAP_FILE_PATH"
         if self.use_exclusion:
             param_dict["--use_exclusion"] = "True"
+        if self.use_spa:
+            param_dict["--use_spa"] = "True"
+            if self.spa_cutoff != 2.0:
+                param_dict["--spa_cutoff"] = self.spa_cutoff
         if self.verbose:
             param_dict["--verbose"] = "True"
         if not self.suppress_warnings:
@@ -1384,6 +1669,13 @@ def main() -> None:
     parser.add_argument("--method",
                         type=str, required=False, default="logit", choices=["logit", "cox"],
                         help="Phecode regression method. Can be 'logit' or 'cox'.")
+    parser.add_argument("--use_spa",
+                        type=_utils.str_to_bool, required=False, default=False,
+                        help="Whether to use saddle point approximation (SPA) for logistic regression p-values. "
+                             "Recommended for imbalanced case-control ratios. Only applies when method='logit'.")
+    parser.add_argument("--spa_cutoff",
+                        type=float, required=False, default=2.0,
+                        help="Standardized score threshold above which the SPA correction is applied. Default 2.0.")
     parser.add_argument("--cox_start_date_col",
                         type=str, required=False,
                         help="Start date column for Cox regression.")
@@ -1471,6 +1763,8 @@ def main() -> None:
         min_phecode_count=args.min_phecode_count,
         output_file_path=args.output_file_path,
         method=args.method,
+        use_spa=args.use_spa,
+        spa_cutoff=args.spa_cutoff,
         batch_size=args.batch_size,
         fall_back_to_serial=args.fall_back_to_serial,
         suppress_warnings=args.suppress_warnings,

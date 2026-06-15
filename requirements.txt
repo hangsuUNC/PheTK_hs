@@ -9,6 +9,7 @@ pandas
 polars
 pyarrow
 pandas
+scipy
 statsmodels
 tqdm
 setuptools
